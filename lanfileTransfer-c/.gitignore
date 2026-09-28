@@ -1,0 +1,18 @@
+# 构建产物
+bin/
+obj/
+*.o
+*.d
+*.a
+*.so
+
+# 接收到的文件（可能含个人资料）
+downloads/
+
+# 运行时日志 —— 内含真实主机名、用户名与绝对路径，切勿入库
+*.log
+lanfileTransfer-c.log
+debug.log
+
+# 认证令牌
+.lanfiletransfer.token

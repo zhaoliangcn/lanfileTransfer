@@ -1,0 +1,21 @@
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 环境覆盖：绝不入库（可能含真实地址与路径）
+.env
+.env.local
+.env.*.local
+
+# 前端临时
+.vite/
+.eslintcache
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# 运行时配置 / 令牌（本项目不提供示例文件，此处兜底）
+config.local.json

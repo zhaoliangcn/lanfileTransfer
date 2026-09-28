@@ -1,0 +1,69 @@
+# ---- 操作系统垃圾文件 ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# ---- Go ----
+# 编译产物
+lanfileTransfer-go/lanfileTransfer-go
+lanfileTransfer-go/lanfileTransfer-go.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+
+# ---- Wails 构建产物 ----
+lanfileTransfer-go/build/bin/
+lanfileTransfer-go/build/darwin/
+lanfileTransfer-go/build/windows/*.manifest
+lanfileTransfer-go/build/linux/
+# 前端产物由 `wails build` 重新生成，不入库
+lanfileTransfer-go/frontend/dist/
+
+# ---- C 端构建产物 ----
+lanfileTransfer-c/bin/
+lanfileTransfer-c/obj/
+lanfileTransfer-c/downloads/
+
+# ---- Node / 前端 ----
+node_modules/
+lanfileTransfer-go/frontend/.vite/
+lanfileTransfer-go/frontend/.eslintcache
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- 运行时日志（含真实主机名与本地路径，切勿入库）----
+*.log
+lanfileTransfer-c/*.log
+
+# ---- 认证令牌 / 设备标识（绝不可入库）----
+lanfiletransfer.token
+.lanfiletransfer.token
+auth_token
+device_id
+*checkpoint*
+transfer_history.json
+config.json
+
+# ---- 编辑器 / IDE ----
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- 编辑器临时文件 ----
+*_test.go.orig
+*.orig
+*.rej

@@ -1,9 +1,11 @@
 package transfer
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestNewChunkManager(t *testing.T) {
@@ -312,5 +314,159 @@ func TestErrors(t *testing.T) {
 	}
 	if ErrNotSender == nil {
 		t.Errorf("ErrNotSender should not be nil")
+	}
+}
+
+func TestCheckpointSizeDoesNotGrowWithFile(t *testing.T) {
+	cases := []struct {
+		name     string
+		fileSize int64
+	}{
+		{"64MB", 64 << 20},
+		{"1GB", 1 << 30},
+		{"4.5GB", int64(4.5 * float64(1<<30))},
+		{"16GB", 16 << 30},
+	}
+
+	const headerSize = int64(12)
+
+	for _, tc := range cases {
+		cm := NewChunkManager(tc.fileSize, DefaultChunkSize)
+		total := cm.TotalChunks()
+		for i := int64(0); i < total; i++ {
+			cm.MarkTransferred(i, "d41d8cd98f00b204e9800998ecf8427e")
+		}
+
+		data, err := cm.Serialize()
+		if err != nil {
+			t.Fatalf("%s: serialize failed: %v", tc.name, err)
+		}
+
+		want := headerSize + (total+7)/8
+		if int64(len(data)) != want {
+			t.Errorf("%s: checkpoint is %d bytes, want %d", tc.name, len(data), want)
+		}
+
+		// The old format json.Marshal-ed one ~115-byte record per chunk and the
+		// send loop rewrote it in full every 640KB of payload, which is what
+		// capped a 4.5GB transfer at roughly 13MB/s.
+		legacy, err := json.Marshal(cm.chunks)
+		if err != nil {
+			t.Fatalf("%s: legacy marshal failed: %v", tc.name, err)
+		}
+		if int64(len(data))*50 > int64(len(legacy)) {
+			t.Errorf("%s: bitmap checkpoint (%d bytes) should be >50x smaller than legacy JSON (%d bytes)",
+				tc.name, len(data), len(legacy))
+		}
+	}
+}
+
+func TestCheckpointWriteCostIsBounded(t *testing.T) {
+	const fileSize = int64(16) << 30
+
+	cm := NewChunkManager(fileSize, DefaultChunkSize)
+	for i := int64(0); i < cm.TotalChunks(); i++ {
+		cm.MarkTransferred(i, "d41d8cd98f00b204e9800998ecf8427e")
+	}
+
+	path := filepath.Join(t.TempDir(), "test.checkpoint")
+
+	start := time.Now()
+	writeCheckpoint("task", path, cm)
+	elapsed := time.Since(start)
+
+	// The send loop pays this every 640KB, so it has to stay far below the
+	// ~6.4ms per-checkpoint budget a 100MB/s transfer allows. The old
+	// json.Marshal-of-the-whole-table format cost ~130ms at this file size.
+	if elapsed > 10*time.Millisecond {
+		t.Errorf("checkpoint write took %v, want under 10ms", elapsed)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("checkpoint was not written: %v", err)
+	}
+	restored := NewChunkManager(fileSize, DefaultChunkSize)
+	if err := restored.Deserialize(data); err != nil {
+		t.Fatalf("roundtrip failed: %v", err)
+	}
+	if restored.GetTransferredCount() != cm.GetTransferredCount() {
+		t.Errorf("restored %d transferred chunks, want %d",
+			restored.GetTransferredCount(), cm.GetTransferredCount())
+	}
+}
+
+func TestDeserializeAcceptsLegacyJSONCheckpoint(t *testing.T) {
+	legacy := []*ChunkInfo{
+		{Index: 0, Offset: 0, Size: 256, Checksum: "c0", Transferred: true},
+		{Index: 1, Offset: 256, Size: 256, Checksum: "c1"},
+		{Index: 2, Offset: 512, Size: 256, Checksum: "c2", Transferred: true},
+		{Index: 3, Offset: 768, Size: 232, Checksum: "c3"},
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("failed to build legacy checkpoint: %v", err)
+	}
+
+	cm := NewChunkManager(1000, 256)
+	if err := cm.Deserialize(data); err != nil {
+		t.Fatalf("legacy checkpoint rejected: %v", err)
+	}
+
+	wantTransferred := []bool{true, false, true, false}
+	wantOffset := []int64{0, 256, 512, 768}
+	for i := range wantTransferred {
+		got := cm.GetChunk(int64(i))
+		if got.Transferred != wantTransferred[i] {
+			t.Errorf("chunk %d transferred = %v, want %v", i, got.Transferred, wantTransferred[i])
+		}
+		if got.Offset != wantOffset[i] {
+			t.Errorf("chunk %d offset = %d, want %d (must come from NewChunkManager)", i, got.Offset, wantOffset[i])
+		}
+	}
+}
+
+func TestDeserializeRejectsMismatchedChunkCount(t *testing.T) {
+	small := NewChunkManager(1000, 256)
+	big := NewChunkManager(4000, 256)
+
+	bitmap, err := small.Serialize()
+	if err != nil {
+		t.Fatalf("serialize failed: %v", err)
+	}
+	if err := big.Deserialize(bitmap); err == nil {
+		t.Error("bitmap covering 4 chunks should be rejected for a 16-chunk file")
+	}
+
+	legacy, err := json.Marshal(make([]*ChunkInfo, 4))
+	if err != nil {
+		t.Fatalf("failed to build legacy checkpoint: %v", err)
+	}
+	if err := big.Deserialize(legacy); err == nil {
+		t.Error("legacy checkpoint covering 4 chunks should be rejected for a 16-chunk file")
+	}
+}
+
+func TestDeserializeRejectsCorruptCheckpoint(t *testing.T) {
+	cm := NewChunkManager(1000, 256)
+
+	full, err := cm.Serialize()
+	if err != nil {
+		t.Fatalf("serialize failed: %v", err)
+	}
+
+	cases := map[string][]byte{
+		"nil":             nil,
+		"empty":           {},
+		"garbage":         []byte("not a checkpoint"),
+		"wrong magic":     append([]byte("XXXX"), full[4:]...),
+		"truncated":       full[:len(full)-1],
+		"header only":     full[:checkpointHeaderSize],
+		"bad legacy json": []byte("[{"),
+	}
+	for name, data := range cases {
+		if err := cm.Deserialize(data); err == nil {
+			t.Errorf("%s: corrupt checkpoint was accepted", name)
+		}
 	}
 }

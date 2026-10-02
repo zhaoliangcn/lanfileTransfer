@@ -3,6 +3,8 @@ package transfer
 import (
 	"LanFileTransfer-Go/internal/network"
 	"LanFileTransfer-Go/pkg/utils"
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -144,16 +146,98 @@ func (cm *ChunkManager) GetMissingChunks() []int64 {
 	return missing
 }
 
+// checkpointFormatMagic prefixes the bitmap checkpoint so Deserialize can tell
+// it apart from the legacy JSON-array format.
+var checkpointFormatMagic = [4]byte{'L', 'F', 'T', 'C'}
+
+// checkpointHeaderSize is magic (4 bytes) + chunk count (big-endian uint64).
+const checkpointHeaderSize = 12
+
+// Serialize encodes the completed-chunk set as a bitmap: one bit per chunk.
+// Nothing else in the record is needed to resume -- GetMissingChunks only reads
+// Transferred, and Index/Offset/Size are recomputed by NewChunkManager.
+//
+// The previous format was json.Marshal over the whole []*ChunkInfo, which the
+// send loop rewrote in full every 10 chunks (640KB of payload). Its size grew
+// with the file (~115 bytes/chunk), so a 4.5GB transfer paid ~8.5MB of marshal
+// and disk work per 640KB sent and plateaued around 13MB/s. A bitmap is fixed
+// at ceil(n/8) bytes instead.
 func (cm *ChunkManager) Serialize() ([]byte, error) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return json.Marshal(cm.chunks)
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	total := len(cm.chunks)
+	buf := make([]byte, checkpointHeaderSize+(total+7)/8)
+	copy(buf[:4], checkpointFormatMagic[:])
+	binary.BigEndian.PutUint64(buf[4:], uint64(total))
+
+	for i, chunk := range cm.chunks {
+		if chunk.Transferred {
+			buf[checkpointHeaderSize+i/8] |= 1 << (uint(i) % 8)
+		}
+	}
+	return buf, nil
 }
 
 func (cm *ChunkManager) Deserialize(data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("empty checkpoint")
+	}
+	if data[0] == '[' {
+		return cm.deserializeLegacy(data)
+	}
+	return cm.deserializeBitmap(data)
+}
+
+func (cm *ChunkManager) deserializeBitmap(data []byte) error {
+	if len(data) < checkpointHeaderSize || !bytes.Equal(data[:4], checkpointFormatMagic[:]) {
+		return fmt.Errorf("unrecognised checkpoint header")
+	}
+
+	storedTotal := binary.BigEndian.Uint64(data[4:])
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	return json.Unmarshal(data, &cm.chunks)
+
+	if storedTotal != uint64(len(cm.chunks)) {
+		return fmt.Errorf("checkpoint has %d chunks but the file needs %d",
+			storedTotal, len(cm.chunks))
+	}
+
+	need := checkpointHeaderSize + (len(cm.chunks)+7)/8
+	if len(data) < need {
+		return fmt.Errorf("truncated checkpoint: have %d bytes, need %d", len(data), need)
+	}
+
+	bits := data[checkpointHeaderSize:]
+	for i, chunk := range cm.chunks {
+		chunk.Transferred = bits[i/8]&(1<<(uint(i)%8)) != 0
+	}
+	return nil
+}
+
+// deserializeLegacy accepts checkpoints written before the bitmap format. Those
+// held Index/Offset/Size/Checksum too, but only Transferred is consumed.
+func (cm *ChunkManager) deserializeLegacy(data []byte) error {
+	var stored []*ChunkInfo
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return fmt.Errorf("invalid legacy checkpoint: %w", err)
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if len(stored) != len(cm.chunks) {
+		return fmt.Errorf("legacy checkpoint has %d chunks but the file needs %d",
+			len(stored), len(cm.chunks))
+	}
+
+	for i, chunk := range stored {
+		if chunk == nil {
+			continue
+		}
+		cm.chunks[i].Transferred = chunk.Transferred
+	}
+	return nil
 }
 
 func SendChunk(conn *network.TCPConnection, header *network.TransferHeader, data []byte) error {

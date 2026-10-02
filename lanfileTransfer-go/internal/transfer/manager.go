@@ -259,6 +259,33 @@ func sendWithRetry(conn *network.TCPConnection, header *network.TransferHeader, 
 	return fmt.Errorf("send failed after %d retries: %w", maxRetries, lastErr)
 }
 
+// writeCheckpoint persists resume state from inside the send loop. The payload
+// is one bit per chunk, so it stays small even for multi-gigabyte files.
+//
+// It writes straight to the destination rather than through a temp+rename.
+// Creating a fresh file costs ~5ms on Windows (vs ~1ms to overwrite one), which
+// would put the ceiling back down near 90MB/s. A process killed mid-write is
+// still safe: os.WriteFile truncates first, so the file comes out short and
+// Deserialize rejects it, falling back to a full re-send instead of trusting a
+// half-written bitmap.
+func writeCheckpoint(taskID, path string, chunkMgr *ChunkManager) {
+	if path == "" {
+		return
+	}
+
+	data, err := chunkMgr.Serialize()
+	if err != nil {
+		utils.SugaredLog.Errorw("failed to serialize checkpoint",
+			"taskID", taskID, "error", err)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		utils.SugaredLog.Errorw("failed to write checkpoint",
+			"taskID", taskID, "error", err)
+	}
+}
+
 func (tm *TransferManager) executeSend(taskID string) {
 	tm.mu.RLock()
 	task, exists := tm.tasks[taskID]
@@ -307,15 +334,24 @@ func (tm *TransferManager) executeSend(taskID string) {
 	if task.CheckpointPath != "" {
 		cpData, err := os.ReadFile(task.CheckpointPath)
 		if err == nil && len(cpData) > 0 {
-			chunkMgr.Deserialize(cpData)
-			startChunk = chunkMgr.GetTransferredCount()
-			task.BytesTransferred = chunkMgr.GetTransferredBytes()
-			task.Progress = chunkMgr.GetProgress()
-			utils.SugaredLog.Infow("resuming transfer from checkpoint",
-				"taskID", taskID,
-				"startChunk", startChunk,
-				"progress", task.Progress,
-			)
+			if err := chunkMgr.Deserialize(cpData); err != nil {
+				// A checkpoint written under a different chunk size (or a corrupt
+				// one) cannot be mapped onto this chunk layout. Start over rather
+				// than trusting a partial match.
+				utils.SugaredLog.Warnw("discarding unusable checkpoint",
+					"taskID", taskID,
+					"error", err,
+				)
+			} else {
+				startChunk = chunkMgr.GetTransferredCount()
+				task.BytesTransferred = chunkMgr.GetTransferredBytes()
+				task.Progress = chunkMgr.GetProgress()
+				utils.SugaredLog.Infow("resuming transfer from checkpoint",
+					"taskID", taskID,
+					"startChunk", startChunk,
+					"progress", task.Progress,
+				)
+			}
 		}
 	}
 
@@ -395,9 +431,7 @@ func (tm *TransferManager) executeSend(taskID string) {
 		}
 
 		if err := sendWithRetry(conn, header, buf[:n], 3); err != nil {
-			if cpData, cpErr := chunkMgr.Serialize(); cpErr == nil {
-				os.WriteFile(task.CheckpointPath, cpData, 0644)
-			}
+			writeCheckpoint(taskID, task.CheckpointPath, chunkMgr)
 			returnBuf()
 			tm.failTask(taskID, fmt.Sprintf("failed to send chunk: %v", err))
 			return
@@ -417,18 +451,14 @@ func (tm *TransferManager) executeSend(taskID string) {
 		}
 
 		if chunkIndex%10 == 0 || chunkIndex == missingChunks[len(missingChunks)-1] {
-			if cpData, cpErr := chunkMgr.Serialize(); cpErr == nil {
-				os.WriteFile(task.CheckpointPath, cpData, 0644)
-			}
+			writeCheckpoint(taskID, task.CheckpointPath, chunkMgr)
 		}
 
 		tm.emitEvent(&TransferEvent{Type: EventTransferProgress, Task: task})
 	}
 
 	if shortRead != "" {
-		if cpData, cpErr := chunkMgr.Serialize(); cpErr == nil {
-			os.WriteFile(task.CheckpointPath, cpData, 0644)
-		}
+		writeCheckpoint(taskID, task.CheckpointPath, chunkMgr)
 		returnBuf()
 		tm.failTask(taskID, shortRead)
 		return

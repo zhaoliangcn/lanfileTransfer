@@ -27,6 +27,7 @@ lanfileTransfer-go/build/windows/*.manifest
 lanfileTransfer-go/build/linux/
 # 前端产物由 `wails build` 重新生成，不入库
 lanfileTransfer-go/frontend/dist/
+lanfileTransfer-go/frontend/package.json.md5
 
 # ---- C 端构建产物 ----
 lanfileTransfer-c/bin/

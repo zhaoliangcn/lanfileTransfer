@@ -32,6 +32,9 @@ type ChunkManager struct {
 	chunks      []*ChunkInfo
 	fileSize    int64
 	totalChunks int64
+
+	transferredCount int64
+	transferredBytes int64
 }
 
 func NewChunkManager(fileSize int64, chunkSize int) *ChunkManager {
@@ -83,8 +86,13 @@ func (cm *ChunkManager) MarkTransferred(index int64, checksum string) {
 	defer cm.mu.Unlock()
 
 	if index >= 0 && index < cm.totalChunks {
-		cm.chunks[index].Transferred = true
-		cm.chunks[index].Checksum = checksum
+		c := cm.chunks[index]
+		if !c.Transferred {
+			c.Transferred = true
+			cm.transferredCount++
+			cm.transferredBytes += int64(c.Size)
+		}
+		c.Checksum = checksum
 	}
 }
 
@@ -92,33 +100,36 @@ func (cm *ChunkManager) GetTransferredCount() int64 {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	var count int64
-	for _, chunk := range cm.chunks {
-		if chunk.Transferred {
-			count++
-		}
-	}
-	return count
+	return cm.transferredCount
 }
 
 func (cm *ChunkManager) GetTransferredBytes() int64 {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	var bytes int64
-	for _, chunk := range cm.chunks {
-		if chunk.Transferred {
-			bytes += int64(chunk.Size)
-		}
-	}
-	return bytes
+	return cm.transferredBytes
 }
 
 func (cm *ChunkManager) GetProgress() float64 {
 	if cm.fileSize == 0 {
 		return 0
 	}
-	return float64(cm.GetTransferredBytes()) / float64(cm.fileSize) * 100
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	return float64(cm.transferredBytes) / float64(cm.fileSize) * 100
+}
+
+func (cm *ChunkManager) recalcLocked() {
+	var count, bytes int64
+	for _, chunk := range cm.chunks {
+		if chunk.Transferred {
+			count++
+			bytes += int64(chunk.Size)
+		}
+	}
+	cm.transferredCount = count
+	cm.transferredBytes = bytes
 }
 
 func (cm *ChunkManager) TotalChunks() int64 {
@@ -212,6 +223,7 @@ func (cm *ChunkManager) deserializeBitmap(data []byte) error {
 	for i, chunk := range cm.chunks {
 		chunk.Transferred = bits[i/8]&(1<<(uint(i)%8)) != 0
 	}
+	cm.recalcLocked()
 	return nil
 }
 
@@ -237,6 +249,7 @@ func (cm *ChunkManager) deserializeLegacy(data []byte) error {
 		}
 		cm.chunks[i].Transferred = chunk.Transferred
 	}
+	cm.recalcLocked()
 	return nil
 }
 

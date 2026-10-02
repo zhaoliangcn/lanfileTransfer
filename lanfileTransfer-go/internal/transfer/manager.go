@@ -268,6 +268,11 @@ func sendWithRetry(conn *network.TCPConnection, header *network.TransferHeader, 
 // still safe: os.WriteFile truncates first, so the file comes out short and
 // Deserialize rejects it, falling back to a full re-send instead of trusting a
 // half-written bitmap.
+var (
+	checkpointMu    sync.Mutex
+	checkpointFiles = map[string]*os.File{}
+)
+
 func writeCheckpoint(taskID, path string, chunkMgr *ChunkManager) {
 	if path == "" {
 		return
@@ -280,9 +285,47 @@ func writeCheckpoint(taskID, path string, chunkMgr *ChunkManager) {
 		return
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := writeCheckpointFile(path, data); err != nil {
 		utils.SugaredLog.Errorw("failed to write checkpoint",
 			"taskID", taskID, "error", err)
+	}
+}
+
+func writeCheckpointFile(path string, data []byte) error {
+	checkpointMu.Lock()
+	defer checkpointMu.Unlock()
+
+	f, ok := checkpointFiles[path]
+	if !ok {
+		var err error
+		f, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			return err
+		}
+		checkpointFiles[path] = f
+	}
+
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := f.Truncate(int64(len(data))); err != nil {
+		return err
+	}
+	_, err := f.Write(data)
+	return err
+}
+
+func closeCheckpoint(path string) {
+	if path == "" {
+		return
+	}
+
+	checkpointMu.Lock()
+	defer checkpointMu.Unlock()
+
+	if f, ok := checkpointFiles[path]; ok {
+		delete(checkpointFiles, path)
+		f.Close()
 	}
 }
 
@@ -361,6 +404,8 @@ func (tm *TransferManager) executeSend(taskID string) {
 		os.MkdirAll(cpDir, 0755)
 		task.CheckpointPath = filepath.Join(cpDir, taskID+".checkpoint")
 	}
+	ckptPath := task.CheckpointPath
+	defer closeCheckpoint(ckptPath)
 
 	missingChunks := chunkMgr.GetMissingChunks()
 	readSize := chunkMgr.ChunkSize()
@@ -473,6 +518,7 @@ func (tm *TransferManager) executeSend(taskID string) {
 		return
 	}
 
+	closeCheckpoint(task.CheckpointPath)
 	os.Remove(task.CheckpointPath)
 	task.CheckpointPath = ""
 

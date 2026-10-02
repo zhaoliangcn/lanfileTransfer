@@ -370,6 +370,7 @@ func TestCheckpointWriteCostIsBounded(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "test.checkpoint")
+	defer closeCheckpoint(path)
 
 	start := time.Now()
 	writeCheckpoint("task", path, cm)
@@ -380,6 +381,20 @@ func TestCheckpointWriteCostIsBounded(t *testing.T) {
 	// json.Marshal-of-the-whole-table format cost ~130ms at this file size.
 	if elapsed > 10*time.Millisecond {
 		t.Errorf("checkpoint write took %v, want under 10ms", elapsed)
+	}
+
+	start = time.Now()
+	writeCheckpoint("task", path, cm)
+	warm := time.Since(start)
+	if warm > 10*time.Millisecond {
+		t.Errorf("warm checkpoint write took %v, want under 10ms", warm)
+	}
+
+	checkpointMu.Lock()
+	_, keptOpen := checkpointFiles[path]
+	checkpointMu.Unlock()
+	if !keptOpen {
+		t.Error("checkpoint handle was not kept open between writes; every 10 chunks would pay a full file open")
 	}
 
 	data, err := os.ReadFile(path)
@@ -468,5 +483,31 @@ func TestDeserializeRejectsCorruptCheckpoint(t *testing.T) {
 		if err := cm.Deserialize(data); err == nil {
 			t.Errorf("%s: corrupt checkpoint was accepted", name)
 		}
+	}
+}
+
+func TestChunkStatsCostDoesNotScaleWithFileSize(t *testing.T) {
+	const chunks = 200000
+
+	cm := NewChunkManager(int64(chunks)*DefaultChunkSize, DefaultChunkSize)
+	if cm.TotalChunks() != chunks {
+		t.Fatalf("created %d chunks, want %d", cm.TotalChunks(), chunks)
+	}
+	for i := int64(0); i < chunks; i++ {
+		cm.MarkTransferred(i, "d41d8cd98f00b204e9800998ecf8427e")
+	}
+	if cm.GetTransferredCount() != chunks {
+		t.Fatalf("count = %d, want %d", cm.GetTransferredCount(), chunks)
+	}
+
+	start := time.Now()
+	for i := 0; i < chunks; i++ {
+		_ = cm.GetTransferredBytes()
+		_ = cm.GetProgress()
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Errorf("200000 stats reads took %v; the per-chunk scan is back", elapsed)
 	}
 }

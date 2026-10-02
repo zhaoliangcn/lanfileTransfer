@@ -143,6 +143,7 @@ ufw allow 9876/tcp && ufw allow 9876/udp
 ## 文档
 
 - [架构设计 · Architecture](lanfileTransfer-go/ARCHITECTURE.md)
+- [性能优化方法论 · Performance Methodology](lanfileTransfer-go/PERFORMANCE.md)
 - [代码审查报告 · Code Review](lanfileTransfer-go/CODE_REVIEW.md)
 - [接收端已知问题时序图 · Known Receiver Issues](lanfileTransfer-c/SEQUENCE_DIAGRAM.md)
 

@@ -34,6 +34,65 @@ type TransferEvent struct {
 
 type TransferEventHandler func(event *TransferEvent)
 
+// progressEventInterval caps how often a progress notification reaches the UI.
+// The send and receive loops run once per chunk, and at line rate that is ~1700
+// chunks/s. Every notification is delivered synchronously to the webview -- on
+// Windows each one marshals to JSON and blocks on the UI thread via
+// ExecJS/Invoke -- so an unthrottled stream saturates the UI thread and the
+// progress bar stops repainting while the file itself keeps moving. Task state
+// is still updated every chunk; only the notification is rate limited.
+const progressEventInterval = 100 * time.Millisecond
+
+// progressLimiter reports whether enough time has passed since the last
+// allowed notification. Not safe for concurrent use: each transfer loop owns
+// its own limiter and drives it from a single goroutine.
+type progressLimiter struct {
+	interval time.Duration
+	last     time.Time
+}
+
+func newProgressLimiter() *progressLimiter {
+	return &progressLimiter{interval: progressEventInterval}
+}
+
+// allow reports whether a notification should be emitted now, and charges the
+// interval when it says yes.
+func (p *progressLimiter) allow() bool {
+	now := time.Now()
+	if p.last.IsZero() {
+		p.last = now
+		return true
+	}
+	if now.Sub(p.last) < p.interval {
+		return false
+	}
+	p.last = now
+	return true
+}
+
+// speedMeter turns a growing byte counter into a bytes/s reading, resampled at
+// a fixed cadence so the number is readable rather than jittering per chunk.
+type speedMeter struct {
+	window time.Duration
+	last   time.Time
+	bytes  int64
+	speed  float64
+}
+
+func (m *speedMeter) update(total int64) (float64, bool) {
+	now := time.Now()
+	if m.last.IsZero() {
+		m.last, m.bytes = now, total
+		return m.speed, false
+	}
+	if elapsed := now.Sub(m.last); elapsed >= m.window {
+		m.speed = float64(total-m.bytes) / elapsed.Seconds()
+		m.last, m.bytes = now, total
+		return m.speed, true
+	}
+	return m.speed, false
+}
+
 type TransferManager struct {
 	mu             sync.RWMutex
 	tasks          map[string]*TransferTask
@@ -420,8 +479,8 @@ func (tm *TransferManager) executeSend(taskID string) {
 	}
 	defer returnBuf()
 
-	lastSpeedTime := time.Now()
-	lastSpeedBytes := task.BytesTransferred
+	meter := &speedMeter{window: 500 * time.Millisecond}
+	progressLim := newProgressLimiter()
 	shortRead := ""
 	// Highest byte offset actually covered by a chunk read in this run. The
 	// chunk table precomputes sizes from the file size measured at task creation,
@@ -486,20 +545,17 @@ func (tm *TransferManager) executeSend(taskID string) {
 		task.BytesTransferred = chunkMgr.GetTransferredBytes()
 		task.Progress = chunkMgr.GetProgress()
 
-		now := time.Now()
-		elapsed := now.Sub(lastSpeedTime)
-		if elapsed >= 500*time.Millisecond {
-			deltaBytes := task.BytesTransferred - lastSpeedBytes
-			task.Speed = float64(deltaBytes) / elapsed.Seconds()
-			lastSpeedTime = now
-			lastSpeedBytes = task.BytesTransferred
+		if speed, updated := meter.update(task.BytesTransferred); updated {
+			task.Speed = speed
 		}
 
 		if chunkIndex%10 == 0 || chunkIndex == missingChunks[len(missingChunks)-1] {
 			writeCheckpoint(taskID, task.CheckpointPath, chunkMgr)
 		}
 
-		tm.emitEvent(&TransferEvent{Type: EventTransferProgress, Task: task})
+		if progressLim.allow() {
+			tm.emitEvent(&TransferEvent{Type: EventTransferProgress, Task: task})
+		}
 	}
 
 	if shortRead != "" {
@@ -539,6 +595,8 @@ func (tm *TransferManager) receiveFile(conn *network.TCPConnection) {
 	var fileWriter *file.FileWriter
 	received := make(map[int64]bool)
 	var receivedBytes int64
+	meter := &speedMeter{window: 500 * time.Millisecond}
+	progressLim := newProgressLimiter()
 
 	// finishTask closes the writer and, unless the transfer turned out to be
 	// incomplete, marks the task as completed. Partial transfers are reported
@@ -649,7 +707,12 @@ func (tm *TransferManager) receiveFile(conn *network.TCPConnection) {
 			receivedBytes += int64(len(data))
 			currentTask.BytesTransferred = receivedBytes
 			currentTask.Progress = currentTask.CalculateProgress()
-			tm.emitEvent(&TransferEvent{Type: EventTransferProgress, Task: currentTask})
+			if speed, updated := meter.update(receivedBytes); updated {
+				currentTask.Speed = speed
+			}
+			if progressLim.allow() {
+				tm.emitEvent(&TransferEvent{Type: EventTransferProgress, Task: currentTask})
+			}
 		}
 
 		if receivedBytes >= currentTask.FileSize {
